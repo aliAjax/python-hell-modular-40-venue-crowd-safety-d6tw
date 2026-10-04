@@ -1,4 +1,12 @@
+from uuid import uuid4
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+DISPOSAL_INITIATE_ROLES = ("coordinator", "admin")
+DISPOSAL_RECOVER_ROLES = ("supervisor", "coordinator", "admin")
+IN_TRANSIT_TASK_STATUSES = ("assigned", "enroute", "on_scene")
+FINISHED_TASK_STATUSES = ("completed", "cancelled")
 
 
 def _find_one(lookup, kind, field, value):
@@ -123,10 +131,18 @@ def _validate_zone_admit(actor, entity, data, lookup):
 
 
 def _validate_gate_open(actor, entity, data, lookup):
-    for zone_id in entity["data"].get("zone_ids") or []:
+    zone_ids = entity["data"].get("zone_ids") or []
+    for zone_id in zone_ids:
         zone = _find_one(lookup, "zone", "id", zone_id)
         if zone and zone["status"] == "evacuating":
-            raise ConflictError("gate cannot open while a connected zone is evacuating")
+            raise ConflictError(
+                "gate %s cannot open: connected zone %s is evacuating" % (entity["id"], zone_id)
+            )
+    if entity["data"].get("evacuation_commands"):
+        raise ConflictError(
+            "gate %s is closed under evacuation command %s"
+            % (entity["id"], entity["data"]["evacuation_commands"][-1])
+        )
     return {"opened_by": actor.user_id}
 
 
@@ -146,6 +162,59 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_disposal_create(actor, data, lookup):
+    zone = _find_one(lookup, "zone", "id", data.get("zone_id"))
+    if not zone:
+        raise ValidationError("disposal zone does not exist")
+    incident_id = data.get("incident_id")
+    if incident_id:
+        incident = _find_one(lookup, "incident", "id", incident_id)
+        if not incident:
+            raise ValidationError("disposal incident does not exist")
+        if incident["data"].get("venue_id") != zone["data"].get("venue_id"):
+            raise ValidationError("disposal incident must belong to the zone venue")
+        if incident["data"].get("zone_id") != zone["id"]:
+            raise ValidationError("disposal incident must be located in the zone")
+    if zone["status"] not in ("open", "limited"):
+        raise ConflictError("zone is not open for evacuation (status: %s)" % zone["status"])
+    for disposal in lookup("disposal", "zone_id", zone["id"]) or []:
+        if disposal["status"] == "active":
+            raise ConflictError("zone already has an active disposal order: " + disposal["id"])
+    if incident_id:
+        for disposal in lookup("disposal", "incident_id", incident_id) or []:
+            if disposal["status"] == "active":
+                raise ConflictError("incident already has an active disposal order: " + disposal["id"])
+    command_no = data.get("command_no") or ("CMD-" + uuid4().hex[:12].upper())
+    return {"command_no": command_no}
+
+
+def _validate_disposal_recover(actor, entity, data, lookup):
+    if entity["status"] != "active":
+        raise InvalidTransition("disposal is not active (status: %s)" % entity["status"])
+    incident_id = entity["data"].get("incident_id")
+    if not incident_id:
+        raise ValidationError("disposal has no linked incident")
+    incident = _find_one(lookup, "incident", "id", incident_id)
+    if not incident:
+        raise ValidationError("disposal incident does not exist")
+    if incident["status"] != "resolved":
+        raise ConflictError(
+            "incident %s is not resolved (status: %s)" % (incident["id"], incident["status"])
+        )
+    zone_id = entity["data"].get("zone_id")
+    for task in lookup("task", "incident_id", incident_id) or []:
+        if task["status"] in IN_TRANSIT_TASK_STATUSES:
+            raise ConflictError(
+                "task %s is still in transit (%s)" % (task["id"], task["status"])
+            )
+    for task in lookup("task", "zone_id", zone_id) or []:
+        if task["status"] in IN_TRANSIT_TASK_STATUSES:
+            raise ConflictError(
+                "task %s is still in transit (%s)" % (task["id"], task["status"])
+            )
+    return {"recovered_by": actor.user_id}
+
+
 class RuleEngine:
     ALIASES = {
         "venues": "venue",
@@ -155,6 +224,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "disposals": "disposal",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +234,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "disposal": "active",
     }
     TRANSITIONS = {
         "venue": {
@@ -209,6 +280,9 @@ class RuleEngine:
             "complete": (("on_scene",), "completed"),
             "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
         },
+        "disposal": {
+            "recover": (("active",), "recovered"),
+        },
     }
     CREATE_REQUIRED = {
         "venue": ("name", "address"),
@@ -218,6 +292,7 @@ class RuleEngine:
         "medical_point": ("venue_id", "zone_id", "capacity", "equipment_level"),
         "incident": ("venue_id", "zone_id", "source_ref", "incident_type", "severity", "reported_at"),
         "task": ("incident_id", "venue_id", "zone_id", "team_id", "task_type"),
+        "disposal": ("zone_id",),
     }
     ACTION_REQUIRED = {
         ("venue", "limit"): ("reason", "capacity_limit"),
@@ -253,6 +328,7 @@ class RuleEngine:
         "medical_point": ("supervisor", "coordinator", "admin"),
         "incident": ("operator", "supervisor", "coordinator", "admin"),
         "task": ("supervisor", "coordinator", "admin"),
+        "disposal": DISPOSAL_INITIATE_ROLES,
     }
     ROLE_ACTIONS = {
         "limit": ("coordinator", "supervisor", "admin"),
@@ -276,6 +352,7 @@ class RuleEngine:
         "arrive": ("operator", "supervisor", "admin"),
         "complete": ("operator", "supervisor", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "recover": DISPOSAL_RECOVER_ROLES,
     }
     CUSTOM_CREATE = {
         "venue": _validate_venue,
@@ -285,6 +362,7 @@ class RuleEngine:
         "medical_point": _validate_medical_point,
         "incident": _validate_incident,
         "task": _validate_task,
+        "disposal": _validate_disposal_create,
     }
     CUSTOM_TRANSITIONS = {
         ("zone", "admit"): _validate_zone_admit,
@@ -292,6 +370,7 @@ class RuleEngine:
         ("gate", "open"): _validate_gate_open,
         ("incident", "correct"): _validate_correct,
         ("task", "assign"): _validate_task_assign,
+        ("disposal", "recover"): _validate_disposal_recover,
     }
 
     def normalize_kind(self, kind):

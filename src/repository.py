@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -69,15 +70,54 @@ class SQLiteRepository:
             "updated_at": row["updated_at"],
         }
 
+    @contextmanager
+    def _tx(self):
+        """Write transaction. Any exception rolls back every statement."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _insert_entity(connection, entity_id, kind, status, data, actor_id, now):
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (entity_id, kind, status, payload, actor_id, now, now),
+        )
+
+    @staticmethod
+    def _update_entity(connection, entity_id, expected_version, status, data, now):
+        row = connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, now, entity_id, current_version),
+        )
+        return current_version + 1
+
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
-        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
-                (entity_id, kind, status, payload, actor_id, now, now),
-            )
+        with self._tx() as connection:
+            self._insert_entity(connection, entity_id, kind, status, data, actor_id, now)
         return self.get_entity(entity_id)
 
     def get_entity(self, entity_id):
@@ -112,33 +152,81 @@ class SQLiteRepository:
 
     def update_entity(self, entity_id, expected_version, status, data):
         now = utcnow()
-        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT version FROM entities WHERE id = ?", (entity_id,)
-            ).fetchone()
-            if not row:
-                raise NotFoundError("entity not found: " + entity_id)
-            current_version = int(row["version"])
-            if expected_version is not None and current_version != int(expected_version):
-                raise ConflictError(
-                    "version conflict: expected %s, found %s"
-                    % (expected_version, current_version)
-                )
-            connection.execute(
-                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
-                "WHERE id = ? AND version = ?",
-                (status, payload, now, entity_id, current_version),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        with self._tx() as connection:
+            self._update_entity(connection, entity_id, expected_version, status, data, now)
         return self.get_entity(entity_id)
+
+    def apply_disposal_initiation(self, disposal, zone, gates, tasks):
+        """Atomically link zone, gates, tasks and insert the disposal order."""
+        now = utcnow()
+        with self._tx() as connection:
+            self._update_entity(
+                connection,
+                zone["id"],
+                zone["expected_version"],
+                zone["status"],
+                zone["data"],
+                now,
+            )
+            for gate in gates:
+                self._update_entity(
+                    connection,
+                    gate["id"],
+                    gate["expected_version"],
+                    gate["status"],
+                    gate["data"],
+                    now,
+                )
+            for task in tasks:
+                self._update_entity(
+                    connection,
+                    task["id"],
+                    task["expected_version"],
+                    task["status"],
+                    task["data"],
+                    now,
+                )
+            self._insert_entity(
+                connection,
+                disposal["id"],
+                disposal["kind"],
+                disposal["status"],
+                disposal["data"],
+                disposal["data"]["initiated_by"],
+                now,
+            )
+        return self.get_entity(disposal["id"])
+
+    def apply_disposal_recovery(self, disposal, zone, gates):
+        """Atomically recover the disposal order, zone and shared gates."""
+        now = utcnow()
+        with self._tx() as connection:
+            self._update_entity(
+                connection,
+                disposal["id"],
+                disposal["expected_version"],
+                disposal["status"],
+                disposal["data"],
+                now,
+            )
+            self._update_entity(
+                connection,
+                zone["id"],
+                zone["expected_version"],
+                zone["status"],
+                zone["data"],
+                now,
+            )
+            for gate in gates:
+                self._update_entity(
+                    connection,
+                    gate["id"],
+                    gate["expected_version"],
+                    gate["status"],
+                    gate["data"],
+                    now,
+                )
+        return self.get_entity(disposal["id"])
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

@@ -138,6 +138,8 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 3 and parts == ["api", "admin", "upgrade-evacuations"]:
+                    return self._send(200, {"items": service.backfill_legacy_evacuations(actor)})
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(
