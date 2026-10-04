@@ -95,16 +95,56 @@ def _validate_task(actor, data, lookup):
     return {}
 
 
+# Tasks whose crews are still on the ground and must be pulled back on evacuation.
+TASK_INFLIGHT_STATUSES = ("assigned", "enroute", "on_scene")
+# A returned task that is waiting for commander review before it can be sent again.
+TASK_REVIEW_STATUS = "in_review"
+EVACUATION_ACTIVE_STATUSES = ("executing",)
+
+
+def _evacuation_blocker(entity, lookup):
+    """Return (command_no, zone_id) from the first active hold on a gate's zones."""
+    for zone_id in entity["data"].get("zone_ids") or []:
+        zone = _find_one(lookup, "zone", "id", zone_id)
+        if zone and zone["status"] == "evacuating":
+            command_no = zone["data"].get("evacuation_command")
+            return command_no, zone_id
+        if zone:
+            for order in lookup("evacuation_order", "zone_id", zone_id) or []:
+                if order["status"] in EVACUATION_ACTIVE_STATUSES:
+                    return order["data"].get("command_no"), zone_id
+    return None, None
+
+
 def _validate_zone_admit(actor, entity, data, lookup):
+    gate = _find_one(lookup, "gate", "id", data.get("gate_id"))
+    if not gate:
+        raise ValidationError("entry gate does not exist")
+    # An evacuating zone (or a gate held by an evacuation order) rejects the
+    # admission as a conflict that names the blocking command, so teams arriving
+    # at the wrong entry point see exactly which order stopped them.
+    command_no, blocker_zone = _evacuation_blocker(gate, lookup)
+    if command_no:
+        raise ConflictError(
+            "gate %s conflicts with evacuation command %s on zone %s"
+            % (gate["id"], command_no, blocker_zone)
+        )
+    holds = gate["data"].get("evacuation_holds") or []
+    if holds:
+        raise ConflictError(
+            "entry gate %s is closed by evacuation command %s"
+            % (gate["id"], ",".join(str(item) for item in holds))
+        )
+    if entity["status"] == "evacuating":
+        raise ConflictError("zone %s is evacuating" % entity["id"])
+    if gate["status"] != "open":
+        raise ConflictError("entry gate is not open")
     try:
         count = int(data.get("count"))
     except (TypeError, ValueError):
         raise ValidationError("admission count must be an integer")
     if count <= 0:
         raise ValidationError("admission count must be positive")
-    gate = _find_one(lookup, "gate", "id", data.get("gate_id"))
-    if not gate or gate["status"] != "open":
-        raise ConflictError("entry gate is not open")
     if entity["id"] not in (gate["data"].get("zone_ids") or []):
         raise ValidationError("gate does not serve this zone")
     occupancy = int(entity["data"].get("current_occupancy", 0))
@@ -122,20 +162,66 @@ def _validate_zone_admit(actor, entity, data, lookup):
     }
 
 
+def _gate_evacuation_conflict(gate, lookup):
+    holds = gate["data"].get("evacuation_holds") or []
+    if holds:
+        raise ConflictError(
+            "gate %s is held by evacuation command %s"
+            % (gate["id"], ",".join(str(item) for item in holds))
+        )
+    command_no, zone_id = _evacuation_blocker(gate, lookup)
+    if command_no:
+        raise ConflictError(
+            "gate %s cannot open while zone %s is evacuating under command %s"
+            % (gate["id"], zone_id, command_no)
+        )
+
+
 def _validate_gate_open(actor, entity, data, lookup):
-    for zone_id in entity["data"].get("zone_ids") or []:
-        zone = _find_one(lookup, "zone", "id", zone_id)
-        if zone and zone["status"] == "evacuating":
-            raise ConflictError("gate cannot open while a connected zone is evacuating")
+    _gate_evacuation_conflict(entity, lookup)
     return {"opened_by": actor.user_id}
 
 
+def _validate_gate_restore(actor, entity, data, lookup):
+    _gate_evacuation_conflict(entity, lookup)
+    return {"restored_by": actor.user_id}
+
+
 def _validate_task_assign(actor, entity, data, lookup):
-    active = {"assigned", "enroute", "on_scene"}
+    active = set(TASK_INFLIGHT_STATUSES)
     for task in lookup("task", "team_id", entity["data"].get("team_id")) or []:
         if task["id"] != entity["id"] and task["status"] in active:
             raise ConflictError("team already has an active task")
-    return {"assigned_by": actor.user_id}
+    patch = {"assigned_by": actor.user_id}
+    if entity["status"] == TASK_REVIEW_STATUS:
+        returned = dict(entity["data"].get("returned_for_review") or {})
+        returned.update({"reassigned_by": actor.user_id, "reassigned_at": data.get("assigned_at")})
+        patch["returned_for_review"] = returned
+    return patch
+
+
+def _validate_task_return_review(actor, entity, data, lookup):
+    if not data.get("reason"):
+        raise ValidationError("return-for-review reason is required")
+    history = list(entity["data"].get("returned_for_review_history") or [])
+    record = {
+        "reason": data["reason"],
+        "command_no": data.get("command_no"),
+        "actor_id": actor.user_id,
+        "from_status": entity["status"],
+    }
+    if data.get("order_id"):
+        record["order_id"] = data["order_id"]
+    history.append(record)
+    return {
+        "returned_for_review": {
+            "reason": data["reason"],
+            "command_no": data.get("command_no"),
+            "actor_id": actor.user_id,
+            "from_status": entity["status"],
+        },
+        "returned_for_review_history": history,
+    }
 
 
 def _validate_correct(actor, entity, data, lookup):
@@ -155,6 +241,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "evacuation_orders": "evacuation_order",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +251,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "evacuation_order": "executing",
     }
     TRANSITIONS = {
         "venue": {
@@ -173,18 +261,15 @@ class RuleEngine:
         },
         "zone": {
             "open": (("closed",), "open"),
-            "admit": (("open", "limited"), "open"),
+            "admit": (("open", "limited", "evacuating"), "open"),
             "restrict": (("open",), "limited"),
-            "evacuate": (("open", "limited"), "evacuating"),
-            "recover": (("evacuating", "limited"), "open"),
-            "close": (("open", "limited"), "closed"),
             "correct": (("closed", "open", "limited", "evacuating"), "closed"),
         },
         "gate": {
             "open": (("closed",), "open"),
             "restrict": (("open",), "restricted"),
             "close": (("open", "restricted"), "closed"),
-            "restore": (("restricted",), "open"),
+            "restore": (("restricted", "closed"), "open"),
         },
         "post": {
             "activate": (("planned", "suspended"), "active"),
@@ -203,11 +288,17 @@ class RuleEngine:
             "correct": (("reported", "triaged", "dispatched", "resolved", "reopened"), "triaged"),
         },
         "task": {
-            "assign": (("draft",), "assigned"),
+            "assign": (("draft", "in_review"), "assigned"),
             "acknowledge": (("assigned",), "enroute"),
             "arrive": (("enroute",), "on_scene"),
             "complete": (("on_scene",), "completed"),
-            "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
+            "cancel": (("draft", "assigned", "enroute", "on_scene", "in_review"), "cancelled"),
+            "return_for_review": (
+                ("assigned", "enroute", "on_scene"), TASK_REVIEW_STATUS
+            ),
+        },
+        "evacuation_order": {
+            "complete": (("executing",), "completed"),
         },
     }
     CREATE_REQUIRED = {
@@ -224,9 +315,6 @@ class RuleEngine:
         ("venue", "close"): ("reason",),
         ("zone", "admit"): ("gate_id", "count", "admitted_at"),
         ("zone", "restrict"): ("reason", "admit_limit"),
-        ("zone", "evacuate"): ("reason",),
-        ("zone", "recover"): ("checklist",),
-        ("zone", "close"): ("reason",),
         ("zone", "correct"): ("reason",),
         ("gate", "open"): ("operator_id",),
         ("gate", "restrict"): ("reason", "flow_limit"),
@@ -244,6 +332,7 @@ class RuleEngine:
         ("task", "arrive"): ("arrived_at",),
         ("task", "complete"): ("completed_at", "outcome"),
         ("task", "cancel"): ("reason",),
+        ("task", "return_for_review"): ("reason",),
     }
     CREATE_ROLES = {
         "venue": ("coordinator", "admin"),
@@ -272,11 +361,15 @@ class RuleEngine:
         "dispatch": ("coordinator", "admin"),
         "resolve": ("supervisor", "coordinator", "admin"),
         "assign": ("supervisor", "coordinator", "admin"),
+        "reassign": ("supervisor", "coordinator", "admin"),
         "acknowledge": ("operator", "supervisor", "admin"),
         "arrive": ("operator", "supervisor", "admin"),
-        "complete": ("operator", "supervisor", "admin"),
+        "complete": ("operator", "supervisor", "coordinator", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "return_for_review": ("supervisor", "coordinator", "admin"),
     }
+    # Roles that may open or close an evacuation disposal order.
+    EVACUATION_ROLES = ("supervisor", "coordinator", "admin")
     CUSTOM_CREATE = {
         "venue": _validate_venue,
         "zone": _validate_zone,
@@ -290,12 +383,17 @@ class RuleEngine:
         ("zone", "admit"): _validate_zone_admit,
         ("zone", "correct"): _validate_correct,
         ("gate", "open"): _validate_gate_open,
+        ("gate", "restore"): _validate_gate_restore,
         ("incident", "correct"): _validate_correct,
         ("task", "assign"): _validate_task_assign,
+        ("task", "return_for_review"): _validate_task_return_review,
     }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    def ensure_role(self, actor, allowed):
+        self._ensure_role(actor, allowed)
 
     def initial_status(self, kind):
         kind = self.normalize_kind(kind)
